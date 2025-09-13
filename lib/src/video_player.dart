@@ -4,18 +4,15 @@
 
 import 'dart:async';
 import 'dart:js_interop';
-import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player_platform_interface/video_player_platform_interface.dart';
-import 'package:http/http.dart' as http;
-import 'package:video_player_web_hls/hls.dart';
-import 'package:video_player_web_hls/no_script_tag_exception.dart';
-import 'package:video_player_web_hls/src/pkg_web_tweaks.dart';
 import 'package:web/web.dart' as web;
 
 import 'duration_utils.dart';
+import 'pkg_web_tweaks.dart';
+import 'hls/video_player_hls_helper.dart';
 
 // An error code value to error name Map.
 // See: https://developer.mozilla.org/en-US/docs/Web/API/MediaError/code
@@ -33,7 +30,6 @@ const Map<int, String> _kErrorValueToErrorDescription = <int, String>{
   2: 'A network error occurred while fetching the video, despite having previously been available.',
   3: 'An error occurred while trying to decode the video, despite having previously been determined to be usable.',
   4: 'The video has been found to be unsuitable (missing or in a format not supported by your browser).',
-  5: 'Could not load manifest'
 };
 
 // The default error message, when the error is an empty string
@@ -41,155 +37,134 @@ const Map<int, String> _kErrorValueToErrorDescription = <int, String>{
 const String _kDefaultErrorMessage =
     'No further diagnostic information can be determined or provided.';
 
-/// Wraps a [html.VideoElement] so its API complies with what is expected by the plugin.
+/// Wraps a [web.HTMLVideoElement] so its API complies with what is expected by the plugin.
 class VideoPlayer {
-  /// Create a [VideoPlayer] from a [html.VideoElement] instance.
+  /// Create a [VideoPlayer] from a [web.HTMLVideoElement] instance.
   VideoPlayer({
     required web.HTMLVideoElement videoElement,
-    required this.uri,
-    required this.headers,
     @visibleForTesting StreamController<VideoEvent>? eventController,
-  })  : _videoElement = videoElement,
-        _eventController = eventController ?? StreamController<VideoEvent>();
+  }) : _videoElement = videoElement,
+       _eventController = eventController ?? StreamController<VideoEvent>() {
+    // Initialize HLS helper for streaming support
+    _hlsHelper = VideoPlayerHlsHelper(
+      videoElement: _videoElement,
+      eventController: _eventController,
+    );
+  }
 
   final StreamController<VideoEvent> _eventController;
   final web.HTMLVideoElement _videoElement;
   web.EventHandler? _onContextMenu;
 
-  final String uri;
-  final Map<String, String> headers;
-
   bool _isInitialized = false;
   bool _isBuffering = false;
-  Hls? _hls;
 
-  /// Force use hlsjs when set to `true`.
-  bool? _hlsFallback;
+  // HLS helper for streaming support
+  late final VideoPlayerHlsHelper _hlsHelper;
 
-  /// Returns the [Stream] of [VideoEvent]s from the inner [html.VideoElement].
+  /// Returns the [Stream] of [VideoEvent]s from the inner [web.HTMLVideoElement].
   Stream<VideoEvent> get events => _eventController.stream;
 
-  final List<StreamSubscription> _eventsSubscriptions = [];
-
-  /// Initializes the wrapped [html.VideoElement].
+  /// Initializes the wrapped [web.HTMLVideoElement].
   ///
   /// This method sets the required DOM attributes so videos can [play] programmatically,
-  /// and attaches listeners to the internal events from the [html.VideoElement]
+  /// and attaches listeners to the internal events from the [web.HTMLVideoElement]
   /// to react to them / expose them through the [VideoPlayer.events] stream.
-  Future<void> initialize() async {
+  ///
+  /// The [src] parameter is the URL of the video. It is passed in from the plugin
+  /// `create` method so it can be set in the VideoElement *last*. This way, all
+  /// the event listeners needed to integrate the videoElement with the plugin
+  /// are attached before any events start firing (events start to fire when the
+  /// `src` attribute is set).
+  ///
+  /// The `src` parameter is nullable for testing purposes.
+  /// The `headers` parameter is optional for custom HTTP headers (used for HLS authentication).
+  void initialize({String? src, Map<String, String>? headers}) {
     _videoElement
       ..autoplay = false
       ..controls = false
       ..playsInline = true;
 
-    if (_hlsFallback == true || await shouldUseHlsLibrary()) {
-      _hlsFallback = false;
-      try {
-        _hls = Hls(
-          HlsConfig(
-            xhrSetup: (web.XMLHttpRequest xhr, String _) {
-              if (headers.isEmpty) {
-                return;
-              }
-
-              if (headers.containsKey('useCookies')) {
-                xhr.withCredentials = true;
-              }
-              headers.forEach((String key, String value) {
-                if (key != 'useCookies') {
-                  xhr.setRequestHeader(key, value);
-                }
-              });
-            }.toJS,
-          ),
-        );
-        _hls!.attachMedia(_videoElement);
-        _hls!.on(
-            'hlsMediaAttached',
-            ((String _, JSObject __) {
-              _hls!.loadSource(uri.toString());
-            }.toJS));
-        _hls!.on(
-            'hlsError',
-            (String _, JSObject data) {
-              try {
-                final ErrorData _data = ErrorData(data);
-                if (_data.fatal) {
-                  _eventController.addError(PlatformException(
-                    code: _kErrorValueToErrorName[2]!,
-                    message: _data.type,
-                    details: _data.details,
-                  ));
-                }
-              } catch (e) {
-                debugPrint('Error parsing hlsError: $e');
-              }
-            }.toJS);
-        _eventsSubscriptions.add(_videoElement.onCanPlay.listen((dynamic _) {
-          _onVideoElementInitialization(_) ;
-          setBuffering(false);
-        }));
-      } catch (e) {
-        throw NoScriptTagException();
-      }
-    } else {
-      _videoElement.src = uri.toString();
-      final onDurationChange = (web.Event event) {
-        if (_videoElement.duration == 0) {
-          return;
-        }
-        _onVideoElementInitialization(event);
-      };
-      _eventsSubscriptions
-          .add(_videoElement.onDurationChange.listen(onDurationChange));
+    // Check if we should use HLS.js for this source
+    if (src != null && _hlsHelper.shouldUseHlsLibrary(src, headers)) {
+      _hlsHelper.initializeHls(uri: src, headers: headers);
     }
 
-    // Needed for Safari iOS 17, which may not send `canplay`.
-    _videoElement.onLoadedMetadata.listen(_onVideoElementInitialization);
+    _videoElement.onCanPlay.listen(_onVideoElementInitialization);
 
-    _eventsSubscriptions.add(_videoElement.onCanPlayThrough.listen((dynamic _) {
+    _videoElement.onCanPlayThrough.listen((dynamic _) {
       setBuffering(false);
-    }));
+    });
 
-    _eventsSubscriptions.add(_videoElement.onPlaying.listen((dynamic _) {
+    _videoElement.onPlaying.listen((dynamic _) {
       setBuffering(false);
-    }));
+    });
 
-    _eventsSubscriptions.add(_videoElement.onWaiting.listen((dynamic _) {
+    _videoElement.onWaiting.listen((dynamic _) {
       setBuffering(true);
       _sendBufferingRangesUpdate();
-    }));
+    });
 
     // The error event fires when some form of error occurs while attempting to load or perform the media.
-    _eventsSubscriptions.add(_videoElement.onError.listen((web.Event _) {
+    _videoElement.onError.listen((web.Event _) async {
+      setBuffering(false);
       // The Event itself (_) doesn't contain info about the actual error.
       // We need to look at the HTMLMediaElement.error.
       // See: https://developer.mozilla.org/en-US/docs/Web/API/HTMLMediaElement/error
       final web.MediaError error = _videoElement.error!;
-      final errorCode = error.code;
-      if (_hls == null && _hlsFallback == null && errorCode == 4) {
-        // MEDIA_ERR_SRC_NOT_SUPPORTED
-        // Native play did not succeed, fallback to hlsjs
-        _hlsFallback = true;
-        // Cancel all event listeners and re initialize
-        for (final sub in _eventsSubscriptions) {
-          sub.cancel();
-        }
-        initialize();
-        return;
+      
+      // Try to handle the error with HLS fallback
+      final bool handled = await _hlsHelper.handleNativePlaybackError(
+        errorCode: error.code,
+        uri: src,
+        headers: headers,
+      );
+      
+      // If HLS didn't handle the error, use original error handling
+      if (!handled) {
+        _eventController.addError(
+          PlatformException(
+            code: _kErrorValueToErrorName[error.code]!,
+            message: error.message != '' ? error.message : _kDefaultErrorMessage,
+            details: _kErrorValueToErrorDescription[error.code],
+          ),
+        );
       }
-      setBuffering(false);
-      _eventController.addError(PlatformException(
-        code: _kErrorValueToErrorName[error.code]!,
-        message: error.message != '' ? error.message : _kDefaultErrorMessage,
-        details: _kErrorValueToErrorDescription[error.code],
-      ));
-    }));
+    });
 
-    _eventsSubscriptions.add(_videoElement.onEnded.listen((dynamic _) {
+    _videoElement.onPlay.listen((dynamic _) {
+      _eventController.add(
+        VideoEvent(
+          eventType: VideoEventType.isPlayingStateUpdate,
+          isPlaying: true,
+        ),
+      );
+    });
+
+    _videoElement.onPause.listen((dynamic _) {
+      _eventController.add(
+        VideoEvent(
+          eventType: VideoEventType.isPlayingStateUpdate,
+          isPlaying: false,
+        ),
+      );
+    });
+
+    _videoElement.onEnded.listen((dynamic _) {
       setBuffering(false);
       _eventController.add(VideoEvent(eventType: VideoEventType.completed));
-    }));
+    });
+
+    // The `src` of the _videoElement is the last property that is set, so all
+    // the listeners for the events that the plugin cares about are attached.
+    // Only set src directly if we're not using HLS.js
+    if (src != null && !_hlsHelper.isHlsActive) {
+      _videoElement.src = src;
+    }
+
+    // Explicitly triggers media loading in preparation for playback. Needed on
+    // iOS to ensure the first frame becomes visible before playback begins.
+    _videoElement.load();
   }
 
   /// Attempts to play the video.
@@ -207,10 +182,9 @@ class VideoPlayer {
       // The rejection handler is called with a DOMException.
       // See: https://developer.mozilla.org/en-US/docs/Web/API/HTMLMediaElement/play
       final web.DOMException exception = e as web.DOMException;
-      _eventController.addError(PlatformException(
-        code: exception.name,
-        message: exception.message,
-      ));
+      _eventController.addError(
+        PlatformException(code: exception.name, message: exception.message),
+      );
       return null;
     }, test: (Object e) => e is web.DOMException);
   }
@@ -231,14 +205,19 @@ class VideoPlayer {
   /// Values must fall between 0 and 1, where 0 is muted and 1 is the loudest.
   ///
   /// When volume is set to 0, the `muted` property is also applied to the
-  /// [html.VideoElement]. This is required for auto-play on the web.
+  /// [web.HTMLVideoElement]. This is required for auto-play on the web.
   void setVolume(double volume) {
     assert(volume >= 0 && volume <= 1);
 
     // TODO(ditman): Do we need to expose a "muted" API?
     // https://github.com/flutter/flutter/issues/60721
-    _videoElement.muted = !(volume > 0.0);
-    _videoElement.volume = volume;
+
+    // If the volume is set to 0.0, only change muted attribute, but don't adjust the volume.
+    _videoElement.muted = volume == 0.0;
+    // Set the volume only if it's greater than 0.0.
+    if (volume > 0.0) {
+      _videoElement.volume = volume;
+    }
   }
 
   /// Sets the playback `speed`.
@@ -289,7 +268,50 @@ class VideoPlayer {
     return Duration(milliseconds: (_videoElement.currentTime * 1000).round());
   }
 
-  /// Disposes of the current [html.VideoElement].
+  /// Sets options
+  Future<void> setOptions(VideoPlayerWebOptions options) async {
+    // In case this method is called multiple times, reset options.
+    _resetOptions();
+
+    if (options.controls.enabled) {
+      _videoElement.controls = true;
+      final String controlsList = options.controls.controlsList;
+      if (controlsList.isNotEmpty) {
+        _videoElement.controlsList = controlsList;
+      }
+
+      if (!options.controls.allowPictureInPicture) {
+        _videoElement.disablePictureInPicture = true;
+      }
+    }
+
+    if (!options.allowContextMenu) {
+      _onContextMenu = ((web.Event event) => event.preventDefault()).toJS;
+      _videoElement.addEventListener('contextmenu', _onContextMenu);
+    }
+
+    if (!options.allowRemotePlayback) {
+      _videoElement.disableRemotePlayback = true;
+    }
+
+    if (options.poster != null) {
+      _videoElement.poster = options.poster!.toString();
+    }
+  }
+
+  void _resetOptions() {
+    _videoElement.controls = false;
+    _videoElement.removeAttribute('controlsList');
+    _videoElement.removeAttribute('disablePictureInPicture');
+    if (_onContextMenu != null) {
+      _videoElement.removeEventListener('contextmenu', _onContextMenu);
+      _onContextMenu = null;
+    }
+    _videoElement.removeAttribute('disableRemotePlayback');
+    _videoElement.removeAttribute('poster');
+  }
+
+  /// Disposes of the current [web.HTMLVideoElement].
   void dispose() {
     _videoElement.removeAttribute('src');
     if (_onContextMenu != null) {
@@ -297,23 +319,38 @@ class VideoPlayer {
       _onContextMenu = null;
     }
     _videoElement.load();
-    _hls?.stopLoad();
-    for (final sub in _eventsSubscriptions) {
-      sub.cancel();
+    
+    // Dispose of HLS resources
+    _hlsHelper.dispose();
+  }
+
+  // Handler to mark (and broadcast) when this player [_isInitialized].
+  //
+  // (Used as a JS event handler for "canplay" and "loadedmetadata")
+  //
+  // This function can be called multiple times by different JS Events, but it'll
+  // only broadcast an "initialized" event the first time it's called, and ignore
+  // the rest of the calls.
+  void _onVideoElementInitialization(Object? _) {
+    if (!_isInitialized) {
+      _isInitialized = true;
+      _sendInitialized();
     }
   }
 
   // Sends an [VideoEventType.initialized] [VideoEvent] with info about the wrapped video.
   void _sendInitialized() {
-    final Duration? duration =
-        convertNumVideoDurationToPluginDuration(_videoElement.duration);
+    final Duration? duration = convertNumVideoDurationToPluginDuration(
+      _videoElement.duration,
+    );
 
-    final Size? size = _videoElement.videoHeight.isFinite
-        ? Size(
-            _videoElement.videoWidth.toDouble(),
-            _videoElement.videoHeight.toDouble(),
-          )
-        : null;
+    final Size? size =
+        _videoElement.videoHeight.isFinite
+            ? Size(
+              _videoElement.videoWidth.toDouble(),
+              _videoElement.videoHeight.toDouble(),
+            )
+            : null;
 
     _eventController.add(
       VideoEvent(
@@ -332,125 +369,38 @@ class VideoPlayer {
   void setBuffering(bool buffering) {
     if (_isBuffering != buffering) {
       _isBuffering = buffering;
-      _eventController.add(VideoEvent(
-        eventType: _isBuffering
-            ? VideoEventType.bufferingStart
-            : VideoEventType.bufferingEnd,
-      ));
+      _eventController.add(
+        VideoEvent(
+          eventType:
+              _isBuffering
+                  ? VideoEventType.bufferingStart
+                  : VideoEventType.bufferingEnd,
+        ),
+      );
     }
   }
 
-  // Broadcasts the [html.VideoElement.buffered] status through the [events] stream.
+  // Broadcasts the [web.HTMLVideoElement.buffered] status through the [events] stream.
   void _sendBufferingRangesUpdate() {
-    _eventController.add(VideoEvent(
-      buffered: _toDurationRange(_videoElement.buffered),
-      eventType: VideoEventType.bufferingUpdate,
-    ));
+    _eventController.add(
+      VideoEvent(
+        buffered: _toDurationRange(_videoElement.buffered),
+        eventType: VideoEventType.bufferingUpdate,
+      ),
+    );
   }
 
   // Converts from [html.TimeRanges] to our own List<DurationRange>.
   List<DurationRange> _toDurationRange(web.TimeRanges buffered) {
     final List<DurationRange> durationRange = <DurationRange>[];
     for (int i = 0; i < buffered.length; i++) {
-      durationRange.add(DurationRange(
-        Duration(milliseconds: (buffered.start(i) * 1000).round()),
-        Duration(milliseconds: (buffered.end(i) * 1000).round()),
-      ));
+      durationRange.add(
+        DurationRange(
+          Duration(milliseconds: (buffered.start(i) * 1000).round()),
+          Duration(milliseconds: (buffered.end(i) * 1000).round()),
+        ),
+      );
     }
     return durationRange;
-  }
-
-  bool canPlayHlsNatively() {
-    bool canPlayHls = false;
-    try {
-      final String canPlayType =
-          _videoElement.canPlayType('application/vnd.apple.mpegurl');
-      canPlayHls = canPlayType != '';
-    } catch (e) {}
-    return canPlayHls;
-  }
-
-  Future<bool> shouldUseHlsLibrary() async {
-    return isSupported() &&
-        (uri.toString().contains('m3u8') || await _testIfM3u8()) &&
-        !canPlayHlsNatively();
-  }
-
-  Future<bool> _testIfM3u8() async {
-    try {
-      final Map<String, String> headers = Map<String, String>.of(this.headers);
-      if (headers.containsKey('Range') || headers.containsKey('range')) {
-        final List<int> range = (headers['Range'] ?? headers['range'])!
-            .split('bytes')[1]
-            .split('-')
-            .map((String e) => int.parse(e))
-            .toList();
-        range[1] = min(range[0] + 1023, range[1]);
-        headers['Range'] = 'bytes=${range[0]}-${range[1]}';
-      } else {
-        headers['Range'] = 'bytes=0-1023';
-      }
-      final http.Response response =
-          await http.get(Uri.parse(this.uri), headers: headers);
-      final String body = response.body;
-      if (!body.contains('#EXTM3U')) {
-        return false;
-      }
-      return true;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  /// Sets options
-  Future<void> setOptions(VideoPlayerWebOptions options) async {
-    // In case this method is called multiple times, reset options.
-    _resetOptions();
-
-    if (options.controls.enabled) {
-      _videoElement.controls = true;
-      final String controlsList = options.controls.controlsList;
-      if (controlsList.isNotEmpty) {
-        _videoElement.controlsList = controlsList.toJS;
-      }
-
-      if (!options.controls.allowPictureInPicture) {
-        _videoElement.disablePictureInPicture = true;
-      }
-    }
-
-    if (!options.allowContextMenu) {
-      _onContextMenu = ((web.Event event) => event.preventDefault()).toJS;
-      _videoElement.addEventListener('contextmenu', _onContextMenu);
-    }
-
-    if (!options.allowRemotePlayback) {
-      _videoElement.disableRemotePlayback = true;
-    }
-  }
-
-  // Handler to mark (and broadcast) when this player [_isInitialized].
-  //
-  // (Used as a JS event handler for "canplay" and "loadedmetadata")
-  //
-  // This function can be called multiple times by different JS Events, but it'll
-  // only broadcast an "initialized" event the first time it's called, and ignore
-  // the rest of the calls.
-  void _onVideoElementInitialization(Object? _) {
-    if (!_isInitialized) {
-      _isInitialized = true;
-      _sendInitialized();
-    }
-  }
-
-  void _resetOptions() {
-    _videoElement.controls = false;
-    _videoElement.removeAttribute('controlsList');
-    _videoElement.removeAttribute('disablePictureInPicture');
-    if (_onContextMenu != null) {
-      _videoElement.removeEventListener('contextmenu', _onContextMenu);
-      _onContextMenu = null;
-    }
-    _videoElement.removeAttribute('disableRemotePlayback');
   }
 }
