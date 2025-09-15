@@ -1,5 +1,5 @@
 @JS()
-library hls.js;
+library;
 
 import 'dart:js_interop';
 

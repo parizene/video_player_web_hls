@@ -6,6 +6,8 @@ void main() {
 }
 
 class VideoApp extends StatefulWidget {
+  const VideoApp({super.key});
+
   @override
   _VideoAppState createState() => _VideoAppState();
 }
